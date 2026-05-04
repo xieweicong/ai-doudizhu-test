@@ -4,7 +4,7 @@ from unittest import mock
 
 from doudizhu.ai import create_ai
 from doudizhu.combos import analyze_cards
-from doudizhu.llm import OpenAICompatibleBackend, ParsedLLMSpec, RemoteLLMAI, parse_llm_spec
+from doudizhu.llm import OpenAICompatibleBackend, ParsedLLMSpec, RemoteLLMAI, parse_llm_spec, summarize_view
 
 
 class FakeBackend:
@@ -93,6 +93,35 @@ class LLMTest(unittest.TestCase):
         self.assertEqual(bid.bid, 2)
         self.assertEqual(play.cards, ("4",))
         self.assertEqual(len(backend.calls), 2)
+
+    def test_summarize_view_keeps_team_and_history_context(self):
+        summary = summarize_view(
+            {
+                "phase": "play",
+                "seat": 1,
+                "players": {0: "A", 1: "B", 2: "C"},
+                "role": "farmer",
+                "role_by_player": {0: "landlord", 1: "farmer", 2: "farmer"},
+                "my_side": "farmers",
+                "landlord": 0,
+                "farmers": [1, 2],
+                "teammate": 2,
+                "opponents": [0],
+                "hand": ["6", "7"],
+                "hand_text": "6 7",
+                "remaining_counts": {0: 2, 1: 2, 2: 1},
+                "played_cards_by_player": {0: ["3"], 1: [], 2: ["9"]},
+                "my_played_cards": [],
+                "current_trick": {"target_player": 2, "target_cards": ["9"]},
+                "full_history": [{"turn": 1}, {"turn": 2}],
+                "recent_history": [{"turn": 2}],
+            }
+        )
+        self.assertEqual(summary["teammate"], 2)
+        self.assertEqual(summary["opponents"], [0])
+        self.assertEqual(summary["played_cards_by_player"][2], ["9"])
+        self.assertEqual(summary["current_trick"]["target_player"], 2)
+        self.assertEqual(summary["full_history"], [{"turn": 1}, {"turn": 2}])
 
     def test_remote_llm_ai_parses_text_fallbacks(self):
         backend = FlakyTextBackend(

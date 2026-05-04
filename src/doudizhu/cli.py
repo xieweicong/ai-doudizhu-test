@@ -8,6 +8,7 @@ from .ai import built_in_ai_names, create_ai
 from .cards import format_cards
 from .env import load_dotenv
 from .game import DouDizhuGame, GameConfig, Player, run_match
+from .web_live import run_live_table
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -21,6 +22,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     play_parser.add_argument("--verbose", action="store_true", help="show initial hands")
     play_parser.add_argument("--show-reasons", action="store_true", help="show AI public reasons")
     play_parser.add_argument("--expose-all-hands", action="store_true", help="let AI views include all hands")
+
+    live_parser = subparsers.add_parser("live", help="run one game in a real-time browser table")
+    _add_player_args(live_parser)
+    live_parser.add_argument("--seed", type=int, default=None)
+    live_parser.add_argument("--show-reasons", action="store_true", help="show AI public reasons")
+    live_parser.add_argument("--expose-all-hands", action="store_true", help="let AI views include all hands")
+    live_parser.add_argument("--host", default="127.0.0.1")
+    live_parser.add_argument("--port", type=int, default=8765)
+    live_parser.add_argument("--no-open", action="store_true", help="do not open browser automatically")
 
     run_parser = subparsers.add_parser("run", help="run many games and print statistics")
     _add_player_args(run_parser)
@@ -43,6 +53,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "play":
         players = _make_players(args.players, args.seed)
         return _play_one(args, players)
+    if args.command == "live":
+        players = _make_players(args.players, args.seed)
+        return _live_one(args, players)
     if args.command == "run":
         if args.rounds <= 0:
             raise SystemExit("--rounds must be positive")
@@ -110,6 +123,18 @@ def _play_one(args: argparse.Namespace, players: list[Player]) -> int:
     return 0
 
 
+def _live_one(args: argparse.Namespace, players: list[Player]) -> int:
+    config = GameConfig(seed=args.seed, expose_all_hands=args.expose_all_hands)
+    return run_live_table(
+        players=players,
+        config=config,
+        host=args.host,
+        port=args.port,
+        show_reasons=args.show_reasons,
+        open_browser=not args.no_open,
+    )
+
+
 def _print_live_event(
     event: str,
     payload: dict[str, Any],
@@ -129,6 +154,7 @@ def _print_live_event(
             f"[叫分] {player} 思考中，可选={payload['valid_bids']}，当前最高={payload['highest_bid']}",
             flush=True,
         )
+        print(f"  当前手牌（{len(payload['hand'])} 张）: {format_cards(payload['hand'])}", flush=True)
         return
     if event == "bid_result":
         record = payload["record"]
@@ -152,6 +178,7 @@ def _print_live_event(
             f"，可过={_yes_no(payload['can_pass'])}{tail}",
             flush=True,
         )
+        print(f"  当前手牌（{len(payload['hand'])} 张）: {format_cards(payload['hand'])}", flush=True)
         return
     if event == "play_result":
         record = payload["record"]
@@ -247,7 +274,7 @@ def _spring_label(value: str | None) -> str:
 def _format_reason(reason: str, show_reasons: bool) -> str:
     if not show_reasons or not reason:
         return ""
-    compact = reason.strip().replace("\n", " ")
+    compact = _translate_reason(reason.strip().replace("\n", " "))
     if len(compact) > 100:
         compact = compact[:97] + "..."
     return f"  理由: {compact}"
@@ -255,6 +282,29 @@ def _format_reason(reason: str, show_reasons: bool) -> str:
 
 def _yes_no(value: bool) -> str:
     return "是" if value else "否"
+
+
+def _translate_reason(reason: str) -> str:
+    replacements = {
+        "random bid": "随机叫分",
+        "random pass": "随机选择过牌",
+        "random": "随机选择",
+        "strength": "牌力",
+        "aggressive": "偏进攻",
+        "cautious": "偏保守",
+        "avoid spending bomb": "保留炸弹",
+        "lowest safe": "选择最低安全牌型",
+        "smallest winning": "用最小可压牌",
+        "largest lead": "主动出最多牌",
+        "save bomb": "保留炸弹",
+        "block near-out with": "阻止对手走牌",
+        "model chose pass": "模型选择过牌",
+        "fallback to first legal play": "裁判兜底: 出第一手合法牌",
+    }
+    translated = reason
+    for source, target in replacements.items():
+        translated = translated.replace(source, target)
+    return translated
 
 
 if __name__ == "__main__":

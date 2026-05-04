@@ -103,7 +103,7 @@ class DouDizhuGame:
         for turn in range(1, self.config.max_turns + 1):
             legal = legal_plays(self.hands[current], last_combo)
             can_pass = last_combo is not None and last_player != current
-            record, combo = self._ask_play(current, turn, legal, can_pass, last_combo)
+            record, combo = self._ask_play(current, turn, legal, can_pass, last_combo, last_player)
             self.plays.append(record)
 
             if record.is_pass:
@@ -194,6 +194,7 @@ class DouDizhuGame:
                 "bid_thinking",
                 {
                     "player": seat,
+                    "hand": counter_to_cards(self.hands[seat]),
                     "valid_bids": valid_bids,
                     "highest_bid": highest_bid,
                 },
@@ -203,7 +204,7 @@ class DouDizhuGame:
                 decision = normalize_bid_decision(raw_decision, valid_bids)
             except Exception as error:
                 decision = normalize_bid_decision(0, valid_bids)
-                reason = f"AI bid error: {error}"
+                reason = f"AI 叫分异常: {_describe_exception(error)}"
                 record = BidRecord(seat, decision.bid, reason)
                 self.bids.append(record)
                 self._emit("bid_result", {"record": record})
@@ -228,8 +229,18 @@ class DouDizhuGame:
         legal: list[Combo],
         can_pass: bool,
         last_combo: Combo | None,
+        last_player: int | None,
     ) -> tuple[PlayRecord, Combo | None]:
-        view = self._view_for(seat, phase="play", last_combo=last_combo)
+        view = self._view_for(
+            seat,
+            phase="play",
+            turn=turn,
+            current_player=seat,
+            can_pass=can_pass,
+            last_combo=last_combo,
+            last_player=last_player,
+            current_trick=self._current_trick_view(last_combo, last_player, can_pass),
+        )
         role = self._role_for(seat)
         self._emit(
             "play_thinking",
@@ -237,6 +248,7 @@ class DouDizhuGame:
                 "turn": turn,
                 "player": seat,
                 "role": role,
+                "hand": counter_to_cards(self.hands[seat]),
                 "can_pass": can_pass,
                 "last_combo": None if last_combo is None else last_combo.display(),
                 "legal_count": len(legal),
@@ -247,14 +259,14 @@ class DouDizhuGame:
             decision = normalize_play_decision(raw_decision)
         except Exception as error:
             decision = normalize_play_decision(None)
-            invalid_reason = f"AI play error: {error}"
+            invalid_reason = f"AI 出牌异常: {_describe_exception(error)}"
         else:
             invalid_reason = ""
 
         combo = analyze_cards(decision.cards)
         valid = self._is_valid_play(seat, decision.cards, combo, last_combo, can_pass)
         if not valid:
-            invalid_reason = invalid_reason or "illegal play"
+            invalid_reason = invalid_reason or "非法出牌"
             if can_pass:
                 return (
                     PlayRecord(
@@ -276,7 +288,7 @@ class DouDizhuGame:
                     role=role,
                     cards=fallback.cards,
                     combo=fallback.label,
-                    reason=decision.reason or "fallback to first legal play",
+                    reason=decision.reason or "裁判兜底: 出第一手合法牌",
                     invalid_reason=invalid_reason,
                     remaining=sum(self.hands[seat].values()),
                 ),
@@ -331,32 +343,40 @@ class DouDizhuGame:
         )
 
     def _view_for(self, seat: int, phase: str, **extra: Any) -> dict[str, Any]:
+        history = self._history_view()
         view: dict[str, Any] = {
             "phase": phase,
             "seat": seat,
             "player_name": self.players[seat].name,
+            "players": {index: player.name for index, player in enumerate(self.players)},
             "hand": counter_to_cards(self.hands[seat]),
             "hand_text": format_counter(self.hands[seat]),
+            "hand_count": sum(self.hands[seat].values()),
             "bottom_count": len(self.bottom_cards),
             "played_cards": list(self.played_cards),
+            "played_cards_text": format_cards(self.played_cards),
+            "played_cards_by_player": self._played_cards_by_player(),
+            "my_played_cards": self._played_cards_for(seat),
+            "non_pass_counts": self._non_pass_counts(),
             "remaining_counts": {index: sum(hand.values()) for index, hand in enumerate(self.hands)},
             "bids": [record.__dict__ for record in self.bids],
-            "history": [
-                {
-                    "turn": record.turn,
-                    "player": record.player,
-                    "role": record.role,
-                    "cards": list(record.cards),
-                    "combo": record.combo,
-                    "remaining": record.remaining,
-                }
-                for record in self.plays
-            ],
+            "history": history,
+            "full_history": history,
+            "recent_history": history[-12:],
         }
         if self.landlord is not None:
             view["landlord"] = self.landlord
+            view["farmers"] = list(self.farmers)
             view["role"] = self._role_for(seat)
+            view["role_by_player"] = {
+                index: self._role_for(index)
+                for index in range(3)
+            }
+            view["teammate"] = self._teammate_for(seat)
+            view["opponents"] = self._opponents_for(seat)
+            view["my_side"] = "landlord" if seat == self.landlord else "farmers"
             view["bottom_cards"] = list(self.bottom_cards)
+            view["bottom_cards_text"] = format_cards(self.bottom_cards)
         if self.config.expose_all_hands:
             view["all_hands"] = {
                 index: counter_to_cards(hand)
@@ -373,6 +393,90 @@ class DouDizhuGame:
             }
         view.update(extra)
         return view
+
+    def _history_view(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "turn": record.turn,
+                "player": record.player,
+                "role": record.role,
+                "cards": list(record.cards),
+                "cards_text": format_cards(record.cards),
+                "combo": record.combo,
+                "reason": record.reason,
+                "remaining": record.remaining,
+                "is_pass": record.is_pass,
+            }
+            for record in self.plays
+        ]
+
+    def _played_cards_by_player(self) -> dict[int, list[str]]:
+        return {
+            seat: self._played_cards_for(seat)
+            for seat in range(3)
+        }
+
+    def _played_cards_for(self, seat: int) -> list[str]:
+        cards: list[str] = []
+        for record in self.plays:
+            if record.player == seat and not record.is_pass:
+                cards.extend(record.cards)
+        return cards
+
+    def _non_pass_counts(self) -> dict[int, int]:
+        counts = {seat: 0 for seat in range(3)}
+        for record in self.plays:
+            if not record.is_pass:
+                counts[record.player] += 1
+        return counts
+
+    def _teammate_for(self, seat: int) -> int | None:
+        if self.landlord is None or seat == self.landlord:
+            return None
+        for farmer in self.farmers:
+            if farmer != seat:
+                return farmer
+        return None
+
+    def _opponents_for(self, seat: int) -> list[int]:
+        if self.landlord is None:
+            return [index for index in range(3) if index != seat]
+        if seat == self.landlord:
+            return list(self.farmers)
+        return [self.landlord]
+
+    def _current_trick_view(
+        self,
+        last_combo: Combo | None,
+        last_player: int | None,
+        can_pass: bool,
+    ) -> dict[str, Any]:
+        if last_combo is None:
+            return {
+                "target_player": None,
+                "target_combo": None,
+                "target_cards": [],
+                "can_pass": can_pass,
+                "passes_after_target": 0,
+            }
+        return {
+            "target_player": last_player,
+            "target_combo": last_combo.label,
+            "target_kind": last_combo.kind,
+            "target_cards": list(last_combo.cards),
+            "target_cards_text": format_cards(last_combo.cards),
+            "can_pass": can_pass,
+            "passes_after_target": self._passes_after_last_non_pass(),
+        }
+
+    def _passes_after_last_non_pass(self) -> int:
+        count = 0
+        for record in reversed(self.plays):
+            if record.is_pass:
+                count += 1
+            else:
+                break
+        return count
 
     def _role_for(self, seat: int) -> str:
         if self.landlord is None:
@@ -497,3 +601,14 @@ def result_summary(result: GameResult, players: list[Player]) -> str:
         f"bid={result.bid}; multiplier={result.multiplier}; spring={result.spring or '-'}; turns={result.turns}; "
         f"bottom={format_cards(result.bottom_cards)}"
     )
+
+
+def _describe_exception(error: Exception) -> str:
+    message = str(error).strip()
+    if message:
+        translations = {
+            "model returned empty content": "模型返回了空内容",
+            "模型连续返回空内容，已自动扩容重试但仍未得到正文": "模型连续返回空内容，已自动扩容重试但仍未得到正文",
+        }
+        return translations.get(message, message)
+    return type(error).__name__

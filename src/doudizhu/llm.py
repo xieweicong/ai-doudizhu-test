@@ -12,11 +12,11 @@ from .combos import Combo
 from .decision_types import BidDecision, PlayDecision
 
 SYSTEM_PROMPT = (
-    "You are an AI player in Dou Dizhu. "
-    "You must follow the rules and choose exactly one legal action from the provided options. "
-    "Return JSON only. Do not wrap JSON in markdown. "
-    "Do not reveal hidden chain-of-thought. "
-    "The optional `reason` field must be a short public summary."
+    "你是斗地主 AI 玩家。你必须严格从给定合法动作中选择一个动作。"
+    "请根据身份、队友、剩余牌数、历史出牌和当前目标牌做决策。"
+    "只返回 JSON，不要 markdown，不要额外文字。"
+    "不要泄露私有推理过程。"
+    "`reason` 字段必须是中文短句，最多 30 个汉字。"
 )
 
 
@@ -52,24 +52,28 @@ class RemoteLLMAI:
         short_model = spec.model if len(spec.model) <= 36 else spec.model[:33] + "..."
         self.name = name or f"{spec.provider}@{short_model}"
         self.temperature = float(spec.options.get("temperature", "0"))
-        self.max_tokens = int(spec.options.get("max_tokens", spec.options.get("output_tokens", "220")))
+        self.max_tokens = int(spec.options.get("max_tokens", spec.options.get("output_tokens", "800")))
 
     def choose_bid(self, view: dict[str, Any], valid_bids: list[int]) -> BidDecision:
         payload = {
             "task": "bid",
-            "rules": "Choose one number from valid_bids. Higher bid means stronger confidence.",
+            "rules": "从 valid_bids 里选一个叫分。0 表示不叫，1/2/3 表示叫对应分数。",
+            "decision_notes": [
+                "叫分阶段还没有地主和队友，只根据自己的牌力、叫分记录和风险选择。",
+                "强牌、炸弹、火箭、高牌多时可以更积极；牌散时保守。",
+            ],
             "valid_bids": valid_bids,
             "game_state": summarize_view(view),
-            "output_schema": {"bid": "integer from valid_bids", "reason": "optional short string"},
+            "output_schema": {"bid": "integer from valid_bids", "reason": "中文短句"},
             "output_examples": [
-                {"bid": 0, "reason": "hand is weak"},
-                {"bid": 2, "reason": "good triples and high cards"},
+                {"bid": 0, "reason": "牌力一般，先不叫"},
+                {"bid": 2, "reason": "高牌较多，可以争地主"},
             ],
         }
         response = self.backend.generate_json(
             system_prompt=SYSTEM_PROMPT,
             user_prompt=json.dumps(payload, ensure_ascii=False),
-            max_tokens=min(self.max_tokens, 120),
+            max_tokens=min(self.max_tokens, 800),
             temperature=self.temperature,
         )
         raw_text = str(response.get("raw_text", ""))
@@ -86,10 +90,17 @@ class RemoteLLMAI:
         payload = {
             "task": "play",
             "rules": (
-                "Choose exactly one legal action. "
-                "When can_pass is true, you may return action='pass'. "
-                "Otherwise you must return action='play' with a valid option_index."
+                "只从 legal_options 里选一个合法动作。"
+                "can_pass 为 true 时可以返回 action='pass'。"
+                "否则必须返回 action='play' 和合法 option_index。"
             ),
+            "decision_notes": [
+                "你只能看到自己的手牌和公共信息，不能假设知道别人手牌。",
+                "如果你是农民，要结合 teammate 字段配合同伴，不要无意义压队友的关键牌。",
+                "重点关注 remaining_counts，优先阻止只剩少量牌的对手走完。",
+                "结合 full_history、played_cards_by_player 和 my_played_cards 判断已出过的牌。",
+                "current_trick 描述当前需要压过的牌；如果 target_player 是队友，可以考虑过牌配合。",
+            ],
             "can_pass": can_pass,
             "game_state": summarize_view(view),
             "legal_options": [
@@ -103,13 +114,13 @@ class RemoteLLMAI:
                 for index, combo in enumerate(legal_plays)
             ],
             "output_schema": {
-                "action": "play or pass",
-                "option_index": "required when action=play",
-                "reason": "optional short string",
+                "action": "play 或 pass",
+                "option_index": "action=play 时必填",
+                "reason": "中文短句",
             },
             "output_examples": [
-                {"action": "pass", "reason": "cannot beat target cheaply"},
-                {"action": "play", "option_index": 3, "reason": "best tempo option"},
+                {"action": "pass", "reason": "接牌代价太高"},
+                {"action": "play", "option_index": 3, "reason": "用较小牌压住"},
             ],
         }
         response = self.backend.generate_json(
@@ -165,7 +176,7 @@ class OpenAICompatibleBackend(ChatBackend):
         attempts = []
         if self.include_response_format:
             attempts.append((True, user_prompt))
-        attempts.append((False, user_prompt + "\n\nReturn a compact JSON object only. No markdown, no extra text."))
+        attempts.append((False, user_prompt + "\n\n只返回紧凑 JSON 对象。不要 markdown，不要解释。reason 必须写中文。"))
 
         last_error: Exception | None = None
         for include_response_format, prompt in attempts:
@@ -203,8 +214,9 @@ class OpenAICompatibleBackend(ChatBackend):
                     last_error = error
                     break
 
-        assert last_error is not None
-        raise last_error
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("模型连续返回空内容，已自动扩容重试但仍未得到正文")
 
 
 class OllamaBackend(ChatBackend):
@@ -452,19 +464,39 @@ def summarize_view(view: dict[str, Any]) -> dict[str, Any]:
     summarized = {
         "phase": view.get("phase"),
         "seat": view.get("seat"),
+        "players": view.get("players"),
         "role": view.get("role"),
+        "role_by_player": view.get("role_by_player"),
+        "my_side": view.get("my_side"),
+        "landlord": view.get("landlord"),
+        "farmers": view.get("farmers"),
+        "teammate": view.get("teammate"),
+        "opponents": view.get("opponents"),
         "hand": view.get("hand"),
         "hand_text": view.get("hand_text"),
+        "hand_count": view.get("hand_count"),
         "remaining_counts": view.get("remaining_counts"),
         "highest_bid": view.get("highest_bid"),
         "bids": view.get("bids"),
+        "current_player": view.get("current_player"),
+        "turn": view.get("turn"),
+        "can_pass": view.get("can_pass"),
         "last_combo": view.get("last_combo"),
+        "last_player": view.get("last_player"),
+        "current_trick": view.get("current_trick"),
         "bottom_cards": view.get("bottom_cards"),
-        "recent_history": list(view.get("history", []))[-12:],
+        "bottom_cards_text": view.get("bottom_cards_text"),
+        "played_cards": view.get("played_cards"),
+        "played_cards_text": view.get("played_cards_text"),
+        "played_cards_by_player": view.get("played_cards_by_player"),
+        "my_played_cards": view.get("my_played_cards"),
+        "non_pass_counts": view.get("non_pass_counts"),
+        "recent_history": list(view.get("recent_history") or view.get("history", []))[-12:],
+        "full_history": view.get("full_history", view.get("history", [])),
     }
     if "all_hands" in view:
         summarized["all_hands"] = view["all_hands"]
-    return summarized
+    return {key: value for key, value in summarized.items() if value is not None}
 
 
 def _post_json(

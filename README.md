@@ -6,6 +6,7 @@
 - 斗地主核心牌型识别与比较：单张、对子、三张、三带一、三带二、顺子、连对、飞机、飞机带单、飞机带对、四带二、四带两对、炸弹、火箭。
 - 3 个本地基线 AI：`random`、`greedy`、`conservative`。
 - 多类大模型接入：`OpenAI`、`DeepSeek`、`Gemini`、`Ollama`、`OpenRouter`、`Qwen / DashScope`、`AWS Bedrock Claude`。
+- 中文 CLI 实时播报和浏览器实时牌桌。
 - 可自定义轮数批量运行，并统计胜率、地主胜率、农民胜率和积分。
 - AI 扩展接口：大模型直连、Python 类插件或外部进程 JSON 接口。
 
@@ -29,6 +30,7 @@
 ```bash
 python -m pip install -e .
 doudizhu play --players greedy conservative random --seed 1 --show-reasons
+doudizhu live --players deepseek openrouter bedrock --show-reasons
 doudizhu run --rounds 10 --players greedy conservative random --seed 42
 ```
 
@@ -42,8 +44,56 @@ cp .env.example .env
 
 ```bash
 PYTHONPATH=src python -m doudizhu.cli play --players greedy conservative random
+PYTHONPATH=src python -m doudizhu.cli live --players greedy conservative random
 PYTHONPATH=src python -m doudizhu.cli run --rounds 100 --players greedy conservative random
 ```
+
+## 运行模式
+
+### CLI 实时播报
+
+```bash
+doudizhu play --players deepseek openrouter bedrock --show-reasons
+```
+
+终端会实时输出：
+
+- 三家起手牌和底牌候选。
+- 每次叫分和出牌前，该 AI 的当前手牌。
+- 当前目标牌、是否合法可过、合法动作数量。
+- 最终出牌、剩余张数、裁判修正原因和公开理由。
+
+### 浏览器直播牌桌
+
+```bash
+doudizhu live --players deepseek openrouter bedrock --show-reasons
+```
+
+`live` 会启动一个本地实时牌桌，默认地址是 `http://127.0.0.1:8765/`。牌局运行时，发牌、叫分、思考中手牌、出牌、最后一手牌和最终积分都会实时推送到浏览器。
+
+直播页面支持：
+
+- 三家手牌动态展示。
+- 当前思考玩家高亮。
+- 出牌动画和桌面中央最后一手牌。
+- 右侧事件历史可滚动查看。
+- 默认跟随最新事件，手动滚动历史时暂停跟随，点击“跟随最新”可回到最新。
+- 长模型名自动缩短显示，悬浮可查看完整名称。
+
+常用参数：
+
+```bash
+doudizhu live --players deepseek openrouter bedrock --show-reasons --port 8876
+doudizhu live --players deepseek openrouter bedrock --show-reasons --no-open
+```
+
+### 批量统计
+
+```bash
+doudizhu run --rounds 100 --players deepseek openrouter bedrock
+```
+
+`run` 会统计每个 AI 的阵营胜率、地主胜率、农民胜率和积分。注意真实大模型批量跑会产生 API 成本，建议先小轮数测试。
 
 ## 直接接大模型
 
@@ -197,6 +247,69 @@ qwen@qwen-plus
 bedrock@anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
 
+也可以给部分 provider 加查询参数覆盖输出配置：
+
+```bash
+deepseek@deepseek-v4-pro?max_tokens=1200&temperature=0
+openrouter@tencent/hy3-preview:free?max_tokens=1200
+```
+
+## AI 能看到什么
+
+默认是“公平玩家视角”：AI 只能看到自己的手牌和公共信息，不会看到其他玩家手牌。
+
+每次叫分和出牌时，AI 会收到结构化上下文，主要包括：
+
+- 自己的座位、模型名、当前手牌和手牌数量。
+- 当前身份：地主或农民。
+- 如果是农民，会明确给出 `teammate` 队友座位；地主没有队友。
+- `opponents` 对手座位。
+- 每个人还剩多少张牌。
+- 叫分记录。
+- 地主确定后的底牌。
+- 当前要压谁的什么牌、是否可以过牌。
+- 所有历史出牌 `full_history`。
+- 最近 12 手 `recent_history`。
+- 每个玩家已经出过哪些牌 `played_cards_by_player`。
+- 自己已经出过哪些牌 `my_played_cards`。
+- 当前步骤全部合法动作 `legal_options`，模型必须从这里选择。
+
+如果你想测试“全知 AI”，可以显式打开：
+
+```bash
+doudizhu play --players deepseek openrouter bedrock --expose-all-hands
+doudizhu live --players deepseek openrouter bedrock --expose-all-hands
+```
+
+打开后，AI 上下文会额外包含 `all_hands`，也就是所有人的当前手牌。这个模式适合做实验，但不再是正常斗地主公平视角。
+
+## LLM 输出约束与容错
+
+LLM 玩家需要返回 JSON。叫分示例：
+
+```json
+{"bid": 2, "reason": "高牌较多，可以争地主"}
+```
+
+出牌示例：
+
+```json
+{"action": "play", "option_index": 3, "reason": "用较小牌压住"}
+```
+
+过牌示例：
+
+```json
+{"action": "pass", "reason": "接牌代价太高"}
+```
+
+程序会做几层兜底：
+
+- 如果模型不支持强制 JSON，会自动降级为普通 chat completions 再解析。
+- 如果推理模型先输出太多 reasoning 导致正文为空，会自动扩大 token 预算重试。
+- 如果模型返回普通文本，会尽量解析叫分、`option_index` 或牌面。
+- 如果模型仍然非法出牌，裁判会修正：可过时过牌，不可过时出第一手合法牌，并在输出里标明裁判修正原因。
+
 ## AI 扩展方式
 
 除了上面的直连大模型，之后接入自定义模型时还有两种方式：
@@ -221,11 +334,20 @@ bedrock@anthropic.claude-3-5-sonnet-20241022-v2:0
 
 CLI 展示的是 AI 提供的公开 `reason` 字段。若接 LLM，建议输出简短理由，不输出私有思维链。
 
+## 安全提示
+
+- `.env` 会被 `.gitignore` 忽略，不要把真实 API key 提交到仓库。
+- 只提交 `.env.example` 这样的模板文件。
+- 如果 key 曾经出现在公开仓库或日志里，请及时轮换。
+- `--show-reasons` 只展示公开短理由，不展示私有思维链。
+
 ## 常用命令
 
 ```bash
 doudizhu list-ai
 doudizhu play --players random greedy conservative --verbose
+doudizhu live --players deepseek openrouter bedrock --show-reasons
+doudizhu live --players deepseek openrouter bedrock --show-reasons --no-open
 doudizhu play --players openai gemini ollama@qwen3:8b --show-reasons
 doudizhu play --players deepseek openrouter@deepseek/deepseek-chat-v3-0324 bedrock --show-reasons
 doudizhu play --players qwen deepseek bedrock --show-reasons

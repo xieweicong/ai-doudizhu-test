@@ -17,11 +17,17 @@ class LiveCliTest(unittest.TestCase):
         ]
         out = io.StringIO()
         with redirect_stdout(out):
-            _print_live_event("bid_thinking", {"player": 0, "valid_bids": [0, 1, 2], "highest_bid": 0}, players, False)
+            _print_live_event(
+                "bid_thinking",
+                {"player": 0, "hand": ("3", "BJ"), "valid_bids": [0, 1, 2], "highest_bid": 0},
+                players,
+                False,
+            )
             _print_live_event("bid_result", {"record": BidRecord(player=0, bid=1, reason="ok")}, players, True)
         text = out.getvalue()
         self.assertIn("思考中", text)
         self.assertIn("叫 1 分", text)
+        self.assertIn("当前手牌", text)
 
     def test_print_initial_deal_uses_chinese_jokers(self):
         players = [
