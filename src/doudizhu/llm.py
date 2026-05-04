@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib import error, parse, request
@@ -60,6 +61,10 @@ class RemoteLLMAI:
             "valid_bids": valid_bids,
             "game_state": summarize_view(view),
             "output_schema": {"bid": "integer from valid_bids", "reason": "optional short string"},
+            "output_examples": [
+                {"bid": 0, "reason": "hand is weak"},
+                {"bid": 2, "reason": "good triples and high cards"},
+            ],
         }
         response = self.backend.generate_json(
             system_prompt=SYSTEM_PROMPT,
@@ -67,8 +72,9 @@ class RemoteLLMAI:
             max_tokens=min(self.max_tokens, 120),
             temperature=self.temperature,
         )
-        bid = _coerce_int(response.get("bid"), default=0)
-        reason = _truncate_reason(response.get("reason", ""))
+        raw_text = str(response.get("raw_text", ""))
+        bid = _coerce_int(response.get("bid"), default=_extract_bid_from_text(raw_text, valid_bids))
+        reason = _truncate_reason(response.get("reason") or raw_text)
         return BidDecision(bid=bid, reason=reason)
 
     def choose_play(
@@ -101,6 +107,10 @@ class RemoteLLMAI:
                 "option_index": "required when action=play",
                 "reason": "optional short string",
             },
+            "output_examples": [
+                {"action": "pass", "reason": "cannot beat target cheaply"},
+                {"action": "play", "option_index": 3, "reason": "best tempo option"},
+            ],
         }
         response = self.backend.generate_json(
             system_prompt=SYSTEM_PROMPT,
@@ -108,16 +118,21 @@ class RemoteLLMAI:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
-        reason = _truncate_reason(response.get("reason", ""))
-        action = str(response.get("action", "play")).strip().lower()
+        raw_text = str(response.get("raw_text", ""))
+        reason = _truncate_reason(response.get("reason") or raw_text)
+        action = _normalize_action(str(response.get("action", "")), raw_text)
         if action == "pass":
             return PlayDecision(cards=(), reason=reason or "model chose pass")
 
-        option_index = _coerce_int(response.get("option_index"), default=-1)
+        option_index = _coerce_int(response.get("option_index"), default=_extract_option_index_from_text(raw_text))
         if 0 <= option_index < len(legal_plays):
             return PlayDecision(cards=legal_plays[option_index].cards, reason=reason)
 
         cards = tuple(response.get("cards", []) or ())
+        if not cards:
+            text_cards = _extract_cards_from_text(raw_text)
+            if text_cards:
+                cards = text_cards
         return PlayDecision(cards=cards, reason=reason)
 
 
@@ -147,28 +162,49 @@ class OpenAICompatibleBackend(ChatBackend):
         max_tokens: int,
         temperature: float,
     ) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        attempts = []
         if self.include_response_format:
-            payload["response_format"] = {"type": "json_object"}
-        headers = {"Content-Type": "application/json", **self.headers}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        response = _post_json(
-            self.url,
-            payload,
-            headers,
-            timeout_seconds=self.timeout_seconds,
-        )
-        content = response["choices"][0]["message"]["content"]
-        return _parse_json_content(content)
+            attempts.append((True, user_prompt))
+        attempts.append((False, user_prompt + "\n\nReturn a compact JSON object only. No markdown, no extra text."))
+
+        last_error: Exception | None = None
+        for include_response_format, prompt in attempts:
+            token_budget = max_tokens
+            for _ in range(3):
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": token_budget,
+                }
+                if include_response_format:
+                    payload["response_format"] = {"type": "json_object"}
+                headers = {"Content-Type": "application/json", **self.headers}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                try:
+                    response = _post_json(
+                        self.url,
+                        payload,
+                        headers,
+                        timeout_seconds=self.timeout_seconds,
+                    )
+                    choice = response["choices"][0]
+                    content = choice["message"].get("content")
+                    finish_reason = choice.get("finish_reason")
+                    if _needs_more_tokens(content, finish_reason):
+                        token_budget = min(token_budget * 4, 2048)
+                        continue
+                    return _parse_json_content(content)
+                except Exception as error:
+                    last_error = error
+                    break
+
+        assert last_error is not None
+        raise last_error
 
 
 class OllamaBackend(ChatBackend):
@@ -311,6 +347,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             api_key=api_key,
             url=_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com") + "/chat/completions",
             model=spec.model,
+            include_response_format=False,
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "gemini":
@@ -335,6 +372,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             url=_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") + "/chat/completions",
             model=spec.model,
             headers=extra_headers,
+            include_response_format=False,
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "qwen":
@@ -457,6 +495,8 @@ def _parse_json_content(content: Any) -> dict[str, Any]:
     if isinstance(content, dict):
         return content
     text = str(content).strip()
+    if not text:
+        raise ValueError("model returned empty content")
     if text.startswith("```"):
         lines = [line for line in text.splitlines() if not line.startswith("```")]
         text = "\n".join(lines).strip()
@@ -467,7 +507,7 @@ def _parse_json_content(content: Any) -> dict[str, Any]:
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             return json.loads(text[start : end + 1])
-        raise ValueError(f"model did not return valid JSON: {text[:300]}")
+        return {"raw_text": text}
 
 
 def _coerce_int(value: Any, *, default: int) -> int:
@@ -480,6 +520,51 @@ def _coerce_int(value: Any, *, default: int) -> int:
 def _truncate_reason(value: Any) -> str:
     text = str(value or "").strip().replace("\n", " ")
     return text[:160]
+
+
+def _needs_more_tokens(content: Any, finish_reason: Any) -> bool:
+    empty_content = content is None or str(content).strip() == ""
+    return empty_content and str(finish_reason or "").lower() == "length"
+
+
+def _extract_bid_from_text(text: str, valid_bids: list[int]) -> int:
+    lowered = text.lower()
+    if any(token in lowered for token in ("不叫", "pass", "bid 0", "bid: 0")):
+        return 0 if 0 in valid_bids else valid_bids[0]
+    for match in re.findall(r"\b[0-3]\b", text):
+        value = int(match)
+        if value in valid_bids:
+            return value
+    return 0 if 0 in valid_bids else valid_bids[0]
+
+
+def _normalize_action(action: str, raw_text: str) -> str:
+    action = action.strip().lower()
+    if action in {"play", "pass"}:
+        return action
+    lowered = raw_text.lower()
+    if any(token in lowered for token in ("pass", "过", "不要")):
+        return "pass"
+    return "play"
+
+
+def _extract_option_index_from_text(text: str) -> int:
+    patterns = [
+        r"option_index\s*[:=]\s*(\d+)",
+        r"option\s*[:=]?\s*(\d+)",
+        r"index\s*[:=]\s*(\d+)",
+        r"第\s*(\d+)\s*个",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return -1
+
+
+def _extract_cards_from_text(text: str) -> tuple[str, ...]:
+    found = re.findall(r"\b(?:10|[3-9JQKA2]|BJ|RJ)\b", text.upper())
+    return tuple(found)
 
 
 def _env(name: str, default: str) -> str:

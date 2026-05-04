@@ -4,7 +4,7 @@ from unittest import mock
 
 from doudizhu.ai import create_ai
 from doudizhu.combos import analyze_cards
-from doudizhu.llm import ParsedLLMSpec, RemoteLLMAI, parse_llm_spec
+from doudizhu.llm import OpenAICompatibleBackend, ParsedLLMSpec, RemoteLLMAI, parse_llm_spec
 
 
 class FakeBackend:
@@ -14,6 +14,14 @@ class FakeBackend:
 
     def generate_json(self, **kwargs):
         self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class FlakyTextBackend:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def generate_json(self, **kwargs):
         return self.responses.pop(0)
 
 
@@ -85,6 +93,79 @@ class LLMTest(unittest.TestCase):
         self.assertEqual(bid.bid, 2)
         self.assertEqual(play.cards, ("4",))
         self.assertEqual(len(backend.calls), 2)
+
+    def test_remote_llm_ai_parses_text_fallbacks(self):
+        backend = FlakyTextBackend(
+            [
+                {"raw_text": "我选择叫 2 分，理由是对子和高牌不错"},
+                {"raw_text": "action=play option_index=1 reason=压最小能赢的牌"},
+            ]
+        )
+        ai = RemoteLLMAI(
+            ParsedLLMSpec("deepseek", "deepseek-v4-flash", {}),
+            backend,
+            name="test-llm",
+        )
+        bid = ai.choose_bid({"phase": "bid", "hand": ["A", "A"], "hand_text": "A A", "history": []}, [0, 1, 2, 3])
+        legal_plays = [analyze_cards(["3"]), analyze_cards(["4"])]
+        play = ai.choose_play(
+            {"phase": "play", "hand": ["3", "4"], "hand_text": "3 4", "history": []},
+            legal_plays,
+            can_pass=False,
+        )
+        self.assertEqual(bid.bid, 2)
+        self.assertEqual(play.cards, ("4",))
+
+    def test_openai_compatible_backend_retries_without_response_format(self):
+        backend = OpenAICompatibleBackend(
+            api_key="token",
+            url="https://example.com/v1/chat/completions",
+            model="test-model",
+            include_response_format=True,
+        )
+        responses = [
+            RuntimeError("https://example.com returned HTTP 400: unsupported response_format"),
+            {"choices": [{"message": {"content": '{"bid": 1, "reason": "ok"}'}}]},
+        ]
+
+        def fake_post_json(url, payload, headers, timeout_seconds):
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with mock.patch("doudizhu.llm._post_json", side_effect=fake_post_json):
+            result = backend.generate_json(
+                system_prompt="system",
+                user_prompt="user",
+                max_tokens=50,
+                temperature=0,
+            )
+        self.assertEqual(result["bid"], 1)
+
+    def test_openai_compatible_backend_retries_when_content_truncated(self):
+        backend = OpenAICompatibleBackend(
+            api_key="token",
+            url="https://example.com/v1/chat/completions",
+            model="test-model",
+            include_response_format=False,
+        )
+        responses = [
+            {"choices": [{"finish_reason": "length", "message": {"content": ""}}]},
+            {"choices": [{"finish_reason": "stop", "message": {"content": '{"bid": 2, "reason": "ok"}'}}]},
+        ]
+
+        def fake_post_json(url, payload, headers, timeout_seconds):
+            return responses.pop(0)
+
+        with mock.patch("doudizhu.llm._post_json", side_effect=fake_post_json):
+            result = backend.generate_json(
+                system_prompt="system",
+                user_prompt="user",
+                max_tokens=120,
+                temperature=0,
+            )
+        self.assertEqual(result["bid"], 2)
 
 
 if __name__ == "__main__":
