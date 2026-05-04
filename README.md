@@ -253,6 +253,7 @@ bedrock@anthropic.claude-3-5-sonnet-20241022-v2:0
 deepseek@deepseek-v4-pro?max_tokens=1200&temperature=0
 openrouter@tencent/hy3-preview:free?max_tokens=1200
 deepseek@deepseek-v4-flash?timeout=120
+deepseek@deepseek-v4-flash?thinking=enabled&max_tokens=8192
 ```
 
 常用参数：
@@ -260,6 +261,8 @@ deepseek@deepseek-v4-flash?timeout=120
 - `max_tokens` / `output_tokens`：模型最大输出 token，默认 800。
 - `temperature`：采样温度，默认 0。
 - `timeout` / `timeout_seconds`：单次模型请求超时时间，OpenAI-compatible 默认 60 秒，Ollama 和 Bedrock 默认 120 秒。
+- `thinking`：DeepSeek 专用，默认 `disabled`，避免模型把输出额度耗在 `reasoning_content` 上而没有返回 JSON 正文；如需实验深度思考可显式设为 `enabled`。
+- `reasoning_effort`：DeepSeek thinking 开启时可传，例如 `high` / `max`。
 
 ## AI 能看到什么
 

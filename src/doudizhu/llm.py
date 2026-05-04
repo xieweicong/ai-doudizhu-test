@@ -162,6 +162,7 @@ class OpenAICompatibleBackend(ChatBackend):
         headers: dict[str, str] | None = None,
         timeout_seconds: float = 60.0,
         include_response_format: bool = True,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.api_key = api_key
         self.url = url
@@ -169,6 +170,7 @@ class OpenAICompatibleBackend(ChatBackend):
         self.headers = headers or {}
         self.timeout_seconds = timeout_seconds
         self.include_response_format = include_response_format
+        self.extra_body = extra_body or {}
 
     def generate_json(
         self,
@@ -197,6 +199,7 @@ class OpenAICompatibleBackend(ChatBackend):
                     "temperature": temperature,
                     "max_tokens": token_budget,
                 }
+                payload.update(self.extra_body)
                 if include_response_format:
                     payload["response_format"] = {"type": "json_object"}
                 headers = {"Content-Type": "application/json", **self.headers}
@@ -375,7 +378,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             url=_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com") + "/chat/completions",
             model=spec.model,
             timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
-            include_response_format=False,
+            extra_body=_deepseek_extra_body(spec.options),
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "gemini":
@@ -706,3 +709,19 @@ def _option_float(options: dict[str, str], *names: str, default: float) -> float
         if value:
             return float(value)
     return default
+
+
+def _deepseek_extra_body(options: dict[str, str]) -> dict[str, Any]:
+    thinking = _normalize_deepseek_thinking(options.get("thinking", options.get("thinking_type", "disabled")))
+    body: dict[str, Any] = {"thinking": {"type": thinking}}
+    reasoning_effort = options.get("reasoning_effort")
+    if thinking == "enabled" and reasoning_effort:
+        body["thinking"]["reasoning_effort"] = reasoning_effort
+    return body
+
+
+def _normalize_deepseek_thinking(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"enabled", "enable", "on", "true", "1", "yes"}:
+        return "enabled"
+    return "disabled"

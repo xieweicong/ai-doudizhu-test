@@ -4,7 +4,7 @@ from unittest import mock
 
 from doudizhu.ai import create_ai
 from doudizhu.combos import analyze_cards
-from doudizhu.llm import OpenAICompatibleBackend, ParsedLLMSpec, RemoteLLMAI, parse_llm_spec, summarize_view
+from doudizhu.llm import OpenAICompatibleBackend, ParsedLLMSpec, RemoteLLMAI, create_llm_ai, parse_llm_spec, summarize_view
 
 
 class FakeBackend:
@@ -57,6 +57,16 @@ class LLMTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "token"}, clear=False):
             ai = create_ai("deepseek")
         self.assertTrue(ai.name.startswith("deepseek@"))
+
+    def test_deepseek_disables_thinking_by_default(self):
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "token"}, clear=False):
+            ai = create_llm_ai("deepseek@deepseek-v4-flash")
+        self.assertEqual(ai.backend.extra_body["thinking"], {"type": "disabled"})
+
+    def test_deepseek_can_enable_thinking_explicitly(self):
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "token"}, clear=False):
+            ai = create_llm_ai("deepseek@deepseek-v4-flash?thinking=enabled&reasoning_effort=max")
+        self.assertEqual(ai.backend.extra_body["thinking"], {"type": "enabled", "reasoning_effort": "max"})
 
     def test_create_ai_recognizes_other_llm_providers(self):
         env = {
@@ -233,6 +243,28 @@ class LLMTest(unittest.TestCase):
                 temperature=0,
             )
         self.assertEqual(result["bid"], 2)
+
+    def test_openai_compatible_backend_adds_extra_body(self):
+        backend = OpenAICompatibleBackend(
+            api_key="token",
+            url="https://example.com/v1/chat/completions",
+            model="test-model",
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        seen_payloads = []
+
+        def fake_post_json(url, payload, headers, timeout_seconds):
+            seen_payloads.append(payload)
+            return {"choices": [{"message": {"content": '{"bid": 1, "reason": "ok"}'}}]}
+
+        with mock.patch("doudizhu.llm._post_json", side_effect=fake_post_json):
+            backend.generate_json(
+                system_prompt="system",
+                user_prompt="user",
+                max_tokens=50,
+                temperature=0,
+            )
+        self.assertEqual(seen_payloads[0]["thinking"], {"type": "disabled"})
 
     def test_openai_compatible_backend_retries_when_content_empty_without_length(self):
         backend = OpenAICompatibleBackend(
