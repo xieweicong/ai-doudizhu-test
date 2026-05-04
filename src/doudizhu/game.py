@@ -266,7 +266,13 @@ class DouDizhuGame:
         combo = analyze_cards(decision.cards)
         valid = self._is_valid_play(seat, decision.cards, combo, last_combo, can_pass)
         if not valid:
-            invalid_reason = invalid_reason or "非法出牌"
+            invalid_reason = invalid_reason or self._invalid_play_reason(
+                seat,
+                decision.cards,
+                combo,
+                last_combo,
+                can_pass,
+            )
             if can_pass:
                 return (
                     PlayRecord(
@@ -341,6 +347,24 @@ class DouDizhuGame:
             and has_cards(self.hands[seat], cards)
             and can_beat(combo, last_combo)
         )
+
+    def _invalid_play_reason(
+        self,
+        seat: int,
+        cards: tuple[str, ...],
+        combo: Combo | None,
+        last_combo: Combo | None,
+        can_pass: bool,
+    ) -> str:
+        if not cards:
+            return "当前必须出牌，模型返回为空或选择了过牌"
+        if combo is None:
+            return f"模型给出的牌无法组成合法牌型: {format_cards(cards)}"
+        if not has_cards(self.hands[seat], cards):
+            return f"模型选择了自己手里没有的牌: {format_cards(cards)}"
+        if last_combo is not None and not can_beat(combo, last_combo):
+            return f"模型选择的牌压不过当前目标: {combo.display()} <= {last_combo.display()}"
+        return "模型返回的出牌不合法"
 
     def _view_for(self, seat: int, phase: str, **extra: Any) -> dict[str, Any]:
         history = self._history_view()
@@ -610,5 +634,7 @@ def _describe_exception(error: Exception) -> str:
             "model returned empty content": "模型返回了空内容",
             "模型连续返回空内容，已自动扩容重试但仍未得到正文": "模型连续返回空内容，已自动扩容重试但仍未得到正文",
         }
+        if message.startswith("模型返回了空正文"):
+            return message
         return translations.get(message, message)
     return type(error).__name__

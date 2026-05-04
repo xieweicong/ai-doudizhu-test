@@ -135,11 +135,16 @@ class RemoteLLMAI:
         if action == "pass":
             return PlayDecision(cards=(), reason=reason or "model chose pass")
 
-        option_index = _coerce_int(response.get("option_index"), default=_extract_option_index_from_text(raw_text))
+        option_index = _coerce_int(
+            _first_present_key(response, "option_index", "index", "option", "choice"),
+            default=_extract_option_index_from_text(raw_text),
+        )
         if 0 <= option_index < len(legal_plays):
             return PlayDecision(cards=legal_plays[option_index].cards, reason=reason)
 
-        cards = tuple(response.get("cards", []) or ())
+        cards = _coerce_cards(
+            _first_present_key(response, "cards", "card", "play_cards", "selected_cards", "play")
+        )
         if not cards:
             text_cards = _extract_cards_from_text(raw_text)
             if text_cards:
@@ -179,8 +184,9 @@ class OpenAICompatibleBackend(ChatBackend):
         attempts.append((False, user_prompt + "\n\n只返回紧凑 JSON 对象。不要 markdown，不要解释。reason 必须写中文。"))
 
         last_error: Exception | None = None
-        for include_response_format, prompt in attempts:
+        for include_response_format, base_prompt in attempts:
             token_budget = max_tokens
+            prompt = base_prompt
             for _ in range(3):
                 payload = {
                     "model": self.model,
@@ -204,10 +210,18 @@ class OpenAICompatibleBackend(ChatBackend):
                         timeout_seconds=self.timeout_seconds,
                     )
                     choice = response["choices"][0]
-                    content = choice["message"].get("content")
+                    message = choice.get("message", {})
+                    content = message.get("content")
                     finish_reason = choice.get("finish_reason")
-                    if _needs_more_tokens(content, finish_reason):
-                        token_budget = min(token_budget * 4, 2048)
+                    if _is_empty_content(content):
+                        reasoning_len = len(str(message.get("reasoning_content") or ""))
+                        last_error = ValueError(_empty_content_message(finish_reason, reasoning_len))
+                        token_budget = min(max(token_budget * 4, 512), 4096)
+                        prompt = (
+                            base_prompt
+                            + "\n\n前一次没有输出可解析的 JSON 正文。"
+                            + "不要展开思考，直接输出一个紧凑 JSON 对象。"
+                        )
                         continue
                     return _parse_json_content(content)
                 except Exception as error:
@@ -351,6 +365,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             api_key=api_key,
             url=_env("OPENAI_BASE_URL", "https://api.openai.com/v1") + "/chat/completions",
             model=spec.model,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "deepseek":
@@ -359,6 +374,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             api_key=api_key,
             url=_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com") + "/chat/completions",
             model=spec.model,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
             include_response_format=False,
         )
         return RemoteLLMAI(spec, backend)
@@ -368,6 +384,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             api_key=api_key,
             url=_env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai") + "/chat/completions",
             model=spec.model,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "openrouter":
@@ -384,6 +401,7 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             url=_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") + "/chat/completions",
             model=spec.model,
             headers=extra_headers,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
             include_response_format=False,
         )
         return RemoteLLMAI(spec, backend)
@@ -395,19 +413,25 @@ def create_llm_ai(spec_text: str) -> RemoteLLMAI:
             api_key=api_key,
             url=_env("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1") + "/chat/completions",
             model=spec.model,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=60.0),
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "ollama":
         backend = OllamaBackend(
             url=_env("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/chat",
             model=spec.model,
+            timeout_seconds=_option_float(spec.options, "timeout", "timeout_seconds", default=120.0),
         )
         return RemoteLLMAI(spec, backend)
     if spec.provider == "bedrock":
         region_name = _first_present_env("AWS_REGION", "AWS_DEFAULT_REGION", "aws_region")
         if not region_name:
             raise ValueError("Missing AWS region. Set AWS_REGION, AWS_DEFAULT_REGION, or aws_region.")
-        backend = BedrockClaudeBackend(model_id=spec.model, region_name=region_name)
+        backend = BedrockClaudeBackend(
+            model_id=spec.model,
+            region_name=region_name,
+            timeout_seconds=int(_option_float(spec.options, "timeout", "timeout_seconds", default=120.0)),
+        )
         return RemoteLLMAI(spec, backend)
     raise ValueError(f"unsupported llm provider: {spec.provider}")
 
@@ -546,7 +570,29 @@ def _coerce_int(value: Any, *, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return default
+        match = re.search(r"-?\d+", str(value or ""))
+        return int(match.group(0)) if match else default
+
+
+def _first_present_key(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_cards(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return _extract_cards_from_text(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(card for card in (_normalize_card(item) for item in value) if card)
+    try:
+        return tuple(card for card in (_normalize_card(item) for item in value or ()) if card)
+    except TypeError:
+        return ()
 
 
 def _truncate_reason(value: Any) -> str:
@@ -554,9 +600,25 @@ def _truncate_reason(value: Any) -> str:
     return text[:160]
 
 
-def _needs_more_tokens(content: Any, finish_reason: Any) -> bool:
-    empty_content = content is None or str(content).strip() == ""
-    return empty_content and str(finish_reason or "").lower() == "length"
+def _is_empty_content(content: Any) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, list):
+        text = "".join(
+            str(block.get("text", "")) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+        return not text.strip()
+    if isinstance(content, str):
+        return not content.strip()
+    return False
+
+
+def _empty_content_message(finish_reason: Any, reasoning_len: int) -> str:
+    reason = str(finish_reason or "-")
+    if reasoning_len:
+        return f"模型返回了空正文(finish_reason={reason}, reasoning_content_len={reasoning_len})"
+    return f"模型返回了空正文(finish_reason={reason})"
 
 
 def _extract_bid_from_text(text: str, valid_bids: list[int]) -> int:
@@ -574,7 +636,11 @@ def _normalize_action(action: str, raw_text: str) -> str:
     action = action.strip().lower()
     if action in {"play", "pass"}:
         return action
-    lowered = raw_text.lower()
+    if action in {"出", "出牌", "打", "压", "play_card"}:
+        return "play"
+    if action in {"过", "不出", "不要", "pass_turn"}:
+        return "pass"
+    lowered = f"{action} {raw_text}".lower()
     if any(token in lowered for token in ("pass", "过", "不要")):
         return "pass"
     return "play"
@@ -595,8 +661,24 @@ def _extract_option_index_from_text(text: str) -> int:
 
 
 def _extract_cards_from_text(text: str) -> tuple[str, ...]:
-    found = re.findall(r"\b(?:10|[3-9JQKA2]|BJ|RJ)\b", text.upper())
+    normalized = (
+        text.upper()
+        .replace("小王", " BJ ")
+        .replace("大王", " RJ ")
+    )
+    found = re.findall(r"\b(?:10|[3-9JQKA2]|BJ|RJ)\b", normalized)
     return tuple(found)
+
+
+def _normalize_card(value: Any) -> str:
+    text = str(value).strip().upper()
+    aliases = {"小王": "BJ", "大王": "RJ"}
+    if text in aliases:
+        return aliases[text]
+    if text in {"3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2", "BJ", "RJ"}:
+        return text
+    extracted = _extract_cards_from_text(text)
+    return extracted[0] if len(extracted) == 1 else ""
 
 
 def _env(name: str, default: str) -> str:
@@ -616,3 +698,11 @@ def _first_present_env(*names: str) -> str:
         if value:
             return value
     return ""
+
+
+def _option_float(options: dict[str, str], *names: str, default: float) -> float:
+    for name in names:
+        value = options.get(name)
+        if value:
+            return float(value)
+    return default

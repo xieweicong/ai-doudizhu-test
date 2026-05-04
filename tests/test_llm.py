@@ -145,6 +145,44 @@ class LLMTest(unittest.TestCase):
         self.assertEqual(bid.bid, 2)
         self.assertEqual(play.cards, ("4",))
 
+    def test_remote_llm_ai_accepts_alternate_play_fields(self):
+        backend = FlakyTextBackend(
+            [
+                {"action": "出牌", "card": "4", "reason": "先压住"},
+            ]
+        )
+        ai = RemoteLLMAI(
+            ParsedLLMSpec("deepseek", "deepseek-v4-flash", {}),
+            backend,
+            name="test-llm",
+        )
+        legal_plays = [analyze_cards(["3"]), analyze_cards(["4"])]
+        play = ai.choose_play(
+            {"phase": "play", "hand": ["3", "4"], "hand_text": "3 4", "history": []},
+            legal_plays,
+            can_pass=False,
+        )
+        self.assertEqual(play.cards, ("4",))
+
+    def test_remote_llm_ai_normalizes_chinese_joker_names(self):
+        backend = FlakyTextBackend(
+            [
+                {"action": "play", "cards": ["小王"], "reason": "出单牌"},
+            ]
+        )
+        ai = RemoteLLMAI(
+            ParsedLLMSpec("deepseek", "deepseek-v4-flash", {}),
+            backend,
+            name="test-llm",
+        )
+        legal_plays = [analyze_cards(["3"]), analyze_cards(["BJ"])]
+        play = ai.choose_play(
+            {"phase": "play", "hand": ["3", "BJ"], "hand_text": "3 小王", "history": []},
+            legal_plays,
+            can_pass=False,
+        )
+        self.assertEqual(play.cards, ("BJ",))
+
     def test_openai_compatible_backend_retries_without_response_format(self):
         backend = OpenAICompatibleBackend(
             api_key="token",
@@ -195,6 +233,30 @@ class LLMTest(unittest.TestCase):
                 temperature=0,
             )
         self.assertEqual(result["bid"], 2)
+
+    def test_openai_compatible_backend_retries_when_content_empty_without_length(self):
+        backend = OpenAICompatibleBackend(
+            api_key="token",
+            url="https://example.com/v1/chat/completions",
+            model="test-model",
+            include_response_format=False,
+        )
+        responses = [
+            {"choices": [{"finish_reason": "stop", "message": {"content": "", "reasoning_content": "thinking"}}]},
+            {"choices": [{"finish_reason": "stop", "message": {"content": '{"bid": 3, "reason": "强牌"}'}}]},
+        ]
+
+        def fake_post_json(url, payload, headers, timeout_seconds):
+            return responses.pop(0)
+
+        with mock.patch("doudizhu.llm._post_json", side_effect=fake_post_json):
+            result = backend.generate_json(
+                system_prompt="system",
+                user_prompt="user",
+                max_tokens=120,
+                temperature=0,
+            )
+        self.assertEqual(result["bid"], 3)
 
 
 if __name__ == "__main__":

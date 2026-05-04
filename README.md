@@ -252,7 +252,14 @@ bedrock@anthropic.claude-3-5-sonnet-20241022-v2:0
 ```bash
 deepseek@deepseek-v4-pro?max_tokens=1200&temperature=0
 openrouter@tencent/hy3-preview:free?max_tokens=1200
+deepseek@deepseek-v4-flash?timeout=120
 ```
+
+常用参数：
+
+- `max_tokens` / `output_tokens`：模型最大输出 token，默认 800。
+- `temperature`：采样温度，默认 0。
+- `timeout` / `timeout_seconds`：单次模型请求超时时间，OpenAI-compatible 默认 60 秒，Ollama 和 Bedrock 默认 120 秒。
 
 ## AI 能看到什么
 
@@ -306,9 +313,9 @@ LLM 玩家需要返回 JSON。叫分示例：
 程序会做几层兜底：
 
 - 如果模型不支持强制 JSON，会自动降级为普通 chat completions 再解析。
-- 如果推理模型先输出太多 reasoning 导致正文为空，会自动扩大 token 预算重试。
+- 如果推理模型先输出太多 reasoning 导致正文为空，会自动扩大 token 预算并追加“直接输出 JSON”的提示重试。
 - 如果模型返回普通文本，会尽量解析叫分、`option_index` 或牌面。
-- 如果模型仍然非法出牌，裁判会修正：可过时过牌，不可过时出第一手合法牌，并在输出里标明裁判修正原因。
+- 如果模型仍然非法出牌，裁判会修正：可过时过牌，不可过时出第一手合法牌，并在输出里标明裁判修正原因。直播界面也会展示底层原因，例如超时、空正文、不能过牌却选择过牌、牌型不合法、压不过目标牌等。
 
 ## AI 扩展方式
 

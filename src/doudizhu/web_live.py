@@ -649,13 +649,23 @@ LIVE_HTML = r"""<!doctype html>
       const shouldStick = state.followLog || log.scrollTop < 12;
       const item = document.createElement("div");
       item.className = "log-item";
-      item.innerHTML = `${text}${detail ? `<small>${detail}</small>` : ""}`;
+      item.innerHTML = `${escapeHtml(text)}${detail ? `<small>${escapeHtml(detail)}</small>` : ""}`;
       log.prepend(item);
       state.logCount += 1;
       document.getElementById("logCount").textContent = `事件记录 ${state.logCount} 条`;
       if (shouldStick) {
         log.scrollTo({ top: 0, behavior: "smooth" });
       }
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[char]));
     }
 
     function playerName(seat) {
@@ -759,10 +769,15 @@ LIVE_HTML = r"""<!doctype html>
         state.hands[data.player] = removeCards(state.hands[data.player] || [], cards);
         renderHand(data.player);
       }
-      const title = cards.length ? `${playerName(data.player)} 出 ${data.combo}` : `${playerName(data.player)} 过`;
+      const cardText = cards.map(rankText).join(" ");
+      const title = cards.length ? `${playerName(data.player)} 出 ${data.combo}${cardText ? ` ${cardText}` : ""}` : `${playerName(data.player)} 过`;
       document.getElementById("lastTitle").textContent = title;
       renderCards("lastCards", cards, true);
-      addLog(`${title}，剩余 ${data.remaining} 张`, `${cards.map(rankText).join(" ")} ${reasonText(data.reason)}`.trim());
+      const details = [
+        data.invalid_reason ? `裁判修正：${data.invalid_reason}` : "",
+        reasonText(data.reason),
+      ].filter(Boolean).join("；");
+      addLog(`${title}，剩余 ${data.remaining} 张`, details);
     });
 
     source.addEventListener("game_result", (event) => {

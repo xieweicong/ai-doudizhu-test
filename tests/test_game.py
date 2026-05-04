@@ -3,7 +3,8 @@ from random import Random
 
 from doudizhu.ai import ConservativeAI, GreedyAI, RandomAI
 from doudizhu.cards import cards_counter
-from doudizhu.combos import analyze_cards
+from doudizhu.combos import analyze_cards, legal_plays
+from doudizhu.decision_types import BidDecision, PlayDecision
 from doudizhu.game import DouDizhuGame, GameConfig, Player, PlayRecord, run_match
 
 
@@ -71,6 +72,35 @@ class GameTest(unittest.TestCase):
         self.assertEqual(view["current_trick"]["target_player"], 2)
         self.assertEqual(view["current_trick"]["target_cards"], ["9"])
         self.assertEqual(len(view["full_history"]), 3)
+
+    def test_required_play_fallback_explains_missing_model_cards(self):
+        class EmptyPlayAI:
+            name = "empty"
+
+            def choose_bid(self, view, valid_bids):
+                return BidDecision(0, "")
+
+            def choose_play(self, view, legal, can_pass):
+                return PlayDecision((), "")
+
+        players = [
+            Player(0, "empty", EmptyPlayAI()),
+            Player(1, "greedy", GreedyAI()),
+            Player(2, "random", RandomAI(Random(4))),
+        ]
+        game = DouDizhuGame(players, GameConfig(seed=11))
+        game.landlord = 0
+        game.farmers = (1, 2)
+        game.hands = [
+            cards_counter(["3", "4"]),
+            cards_counter(["6", "7"]),
+            cards_counter(["9", "10"]),
+        ]
+        legal = legal_plays(game.hands[0], None)
+        record, combo = game._ask_play(0, 1, legal, can_pass=False, last_combo=None, last_player=None)
+        self.assertIsNotNone(combo)
+        self.assertTrue(record.cards)
+        self.assertIn("当前必须出牌", record.invalid_reason)
 
 
 if __name__ == "__main__":
